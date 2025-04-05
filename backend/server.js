@@ -4,7 +4,7 @@ const cors = require("cors");
 const bodyParser = require("body-parser");
 const connectDB = require("./src/config/db");
 const authRoutes = require("./routes/authRoutes");
-const userRoutes = require("./routes/UserRoutes");  // Add this line to import userRoutes
+const userRoutes = require("./routes/userRoutes");  // Add this line to import userRoutes
 const http = require("http");
 const { Server } = require("socket.io");
 const User = require("./models/User"); // Import the User model
@@ -15,7 +15,7 @@ const Game = require("./models/Game"); // Import Game model
 
 
 const friendRoutes = require('./routes/friendRoutes'); // Import the factory function
-
+const leaderboardRoutes = require('./routes/leaderboardRoutes'); 
 // Make sure the path is correct relative to server.js
 const HectocGenerator = require('./utility/HectocGenerator');
 
@@ -39,6 +39,10 @@ let onlineUsers = {}; // { userId: { socketId: socket.id, name: user.name } } <=
 let activeGames = {}; // { gameId: { player1Id, player2Id, puzzle, startTime, timerId, timeLimitSeconds } }
 const GAME_TIME_LIMIT_SECONDS = 300; // Game duration
 
+const POINTS_PER_WIN = 10; // Points awarded for a win
+// const POINTS_PER_LOSS = -5; // Optional: Define points deducted for a loss
+// const POINTS_PER_DRAW = 0;  // Optional: Points for a draw
+
 // Share onlineUsers with Express routes
 app.set('onlineUsers', onlineUsers);
 
@@ -50,6 +54,7 @@ app.use(bodyParser.json());
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);  // Add this line to use userRoutes
 app.use("/api/friends", friendRoutes(io)); // Initialize friend routes with io instance
+app.use("/api/leaderboard", leaderboardRoutes);
 
 // Helper function to get user details for online users
 async function getOnlineUserDetails() {
@@ -157,28 +162,55 @@ async function emitOnlineUsersUpdate() {
                         console.log(`Game ${gameId} saved to DB with status ${status}.`);
 
                         // --- Update Player Stats ---
-                        const updatePromises = [];
-                        if (winnerId && loserId) { // Normal win/loss or abandon
-                            updatePromises.push(
-                                User.findByIdAndUpdate(winnerId, { $inc: { wins: 1, totalGamesPlayed: 1 /*, rating: calculatedRatingChange */ } })
-                            );
-                            updatePromises.push(
-                                User.findByIdAndUpdate(loserId, { $inc: { losses: 1, totalGamesPlayed: 1 /*, rating: -calculatedRatingChange */ } })
-                            );
-                        } else if (status === 'timeout' || status === 'completed_draw') { // Draw scenario
-                            updatePromises.push(
-                                User.findByIdAndUpdate(game.player1Id, { $inc: { draws: 1, totalGamesPlayed: 1 } })
-                            );
-                            updatePromises.push(
-                                User.findByIdAndUpdate(game.player2Id, { $inc: { draws: 1, totalGamesPlayed: 1 } })
-                            );
-                        }
-                        await Promise.all(updatePromises);
-                        console.log(`Stats updated for players in game ${gameId}.`);
+                    //     const updatePromises = [];
+                    //     if (winnerId && loserId) { // Normal win/loss or abandon
+                    //         updatePromises.push(
+                    //             User.findByIdAndUpdate(winnerId, { $inc: { wins: 1, totalGamesPlayed: 1 , points: POINTS_PER_WIN } })
+                    //         );
+                    //         updatePromises.push(
+                    //             User.findByIdAndUpdate(loserId, { $inc: { losses: 1, totalGamesPlayed: 1 /*, points: POINTS_PER_LOSS */ } })
+                    //         );
+                    //     } else if (status === 'timeout' || status === 'completed_draw') { // Draw scenario
+                    //         updatePromises.push(
+                    //             User.findByIdAndUpdate(game.player1Id, { $inc: { draws: 1, totalGamesPlayed: 1 } })
+                    //         );
+                    //         updatePromises.push(
+                    //             User.findByIdAndUpdate(game.player2Id, { $inc: { draws: 1, totalGamesPlayed: 1 } })
+                    //         );
+                    //     }
+                    //     await Promise.all(updatePromises);
+                    //     console.log(`Stats updated for players in game ${gameId}.`);
+
+                    // } catch (dbError) {
+                    //     console.error(`Database error ending game ${gameId}:`, dbError);
+                    //     // Decide how to handle DB errors - maybe retry later? For hackathon, log and continue cleanup.
+                    // }
+
+                     // Update Player Stats & Points
+                    const updatePromises = [];
+                    if (winnerId && loserId) {
+                        // Winner gets points
+                        updatePromises.push(User.findByIdAndUpdate(winnerId, {
+                            $inc: { wins: 1, totalGamesPlayed: 1, points: POINTS_PER_WIN } // Add points for win
+                        }).catch(err => console.error(`[DB] Error updating winner ${winnerId} stats/points:`, err)));
+                        // Loser (optional points change)
+                        updatePromises.push(User.findByIdAndUpdate(loserId, {
+                            $inc: { losses: 1, totalGamesPlayed: 1 /*, points: POINTS_PER_LOSS */ } // Optional point deduction
+                        }).catch(err => console.error(`[DB] Error updating loser ${loserId} stats/points:`, err)));
+                    } else if (status === 'timeout' || status === 'completed_draw') {
+                        // Draw (optional points change)
+                        if (game.player1Id) updatePromises.push(User.findByIdAndUpdate(game.player1Id, {
+                            $inc: { draws: 1, totalGamesPlayed: 1 /*, points: POINTS_PER_DRAW */ }
+                        }).catch(err => console.error(`[DB] Error updating player ${game.player1Id} stats/points (draw):`, err)));
+                        if (game.player2Id) updatePromises.push(User.findByIdAndUpdate(game.player2Id, {
+                            $inc: { draws: 1, totalGamesPlayed: 1 /*, points: POINTS_PER_DRAW */ }
+                        }).catch(err => console.error(`[DB] Error updating player ${game.player2Id} stats/points (draw):`, err)));
+                    }
+                    await Promise.all(updatePromises);
+                    console.log(`[DB] Stats and points update attempted for players in game ${gameId}.`);
 
                     } catch (dbError) {
-                        console.error(`Database error ending game ${gameId}:`, dbError);
-                        // Decide how to handle DB errors - maybe retry later? For hackathon, log and continue cleanup.
+                        console.error(`[DB] Database error during endGame operations for ${gameId}:`, dbError);
                     }
 
                     // Modify the payload creation inside endGame function:
