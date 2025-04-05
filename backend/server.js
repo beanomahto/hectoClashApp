@@ -14,6 +14,10 @@ const math = require('mathjs'); // For safe expression evaluation
 const Game = require("./models/Game"); // Import Game model
 
 
+const friendRoutes = require('./routes/friendRoutes'); // Import the factory function
+
+// Make sure the path is correct relative to server.js
+const HectocGenerator = require('./utility/HectocGenerator');
 
 dotenv.config();
 connectDB();
@@ -45,6 +49,7 @@ app.use(bodyParser.json());
 
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);  // Add this line to use userRoutes
+app.use("/api/friends", friendRoutes(io)); // Initialize friend routes with io instance
 
 // Helper function to get user details for online users
 async function getOnlineUserDetails() {
@@ -71,15 +76,49 @@ async function emitOnlineUsersUpdate() {
 }
 
                 // Generate Hectoc Puzzle
-                function generateHectocPuzzle() {
-                    let puzzle = '';
-                    for (let i = 0; i < 6; i++) {
-                        puzzle += Math.floor(Math.random() * 9) + 1; // Digits 1-9
-                    }
-                    return puzzle;
-                }
+                // function generateHectocPuzzle() {
+                //     let puzzle = '';
+                //     for (let i = 0; i < 6; i++) {
+                //         puzzle += Math.floor(Math.random() * 9) + 1; // Digits 1-9
+                //     }
+                //     return puzzle;
+                // }
+
+                /**
+                 * Validates a Hectoc solution attempt against the puzzle.
+                 * Checks if the correct set of digits were used and if the expression evaluates to 100.
+                 * @param {string} puzzle - The 6-digit puzzle string.
+                 * @param {string} solution - The player's solution expression.
+                 * @returns {{isValid: boolean, reason?: string, result?: number, error?: string}} Validation result.
+                 **/
 
                 
+
+                // Validate Hectoc Solution (Safely)
+                function validateHectocSolution(puzzle, solution) {
+                    if (!solution || typeof solution !== 'string' || solution.trim() === '') {
+                        return { isValid: false, reason: 'empty_solution' };
+                    }
+                    try {
+                        const solutionDigits = solution.replace(/[^1-9]/g, '');
+                        if (solutionDigits !== puzzle) {
+                            console.log(`Validation Fail: Digits. Puzzle: ${puzzle}, Solution Digits: ${solutionDigits}`);
+                            return { isValid: false, reason: 'digit_mismatch' };
+                        }
+                        const result = math.evaluate(solution);
+                        const tolerance = 0.00001;
+                        if (Math.abs(result - 100) < tolerance) {
+                            console.log(`Validation OK: ${solution} = ${result}`);
+                            return { isValid: true, result: result };
+                        } else {
+                            console.log(`Validation Fail: Result ${result} !== 100`);
+                            return { isValid: false, reason: 'wrong_result', result: result };
+                        }
+                    } catch (error) {
+                        console.log(`Validation Fail: Error - ${error.message}`);
+                        return { isValid: false, reason: 'evaluation_error', error: error.message };
+                    }
+                }
 
                 // Function to end a game, update DB, and notify clients
                 async function endGame(gameId, winnerId, loserId, status, reason = "completed", player1Solution = null, player2Solution = null) {
@@ -195,7 +234,37 @@ async function emitOnlineUsersUpdate() {
                     }
                 });
 
-                
+                // socket.on("disconnect", async (reason) => {
+                //     console.log(`User disconnected: ${socket.id}, Reason: ${reason}`);
+                //     if (currentUserId && onlineUsers[currentUserId]?.socketId === socket.id) {
+                //         console.log(`Removing user ${currentUserId} (${onlineUsers[currentUserId]?.name}) from online list.`);
+
+                //         // --- Handle disconnect during active game (Forfeit) ---
+                //         const gameToEnd = Object.values(activeGames).find(g => g.player1Id === currentUserId || g.player2Id === currentUserId);
+                //         if (gameToEnd) {
+                //             console.log(`User ${currentUserId} disconnected during game ${gameToEnd.gameId}. Ending game.`);
+                //             const winner = gameToEnd.player1Id === currentUserId ? gameToEnd.player2Id : gameToEnd.player1Id;
+                //             const loser = currentUserId;
+                //             await endGame(gameToEnd.gameId, winner, loser, 'abandoned', 'opponent_disconnected');
+                //         }
+                //         // --- End Game Handling ---
+
+                //         delete onlineUsers[currentUserId];
+                //         app.set('onlineUsers', onlineUsers);
+                //         await emitOnlineUsersUpdate(); // Notify others
+                //     } else {
+                //         console.log(`Socket ${socket.id} disconnected without a tracked userId.`);
+                //         // Optional: Iterate onlineUsers to double-check if any user has this socket.id
+                //         const userIdToDelete = Object.keys(onlineUsers).find(id => onlineUsers[id]?.socketId === socket.id);
+                //         if (userIdToDelete) {
+                //             console.log(`Found and removing dangling user ${userIdToDelete} on disconnect.`);
+                //             delete onlineUsers[userIdToDelete];
+                //             app.set('onlineUsers', onlineUsers);
+                //             await emitOnlineUsersUpdate();
+                //         }
+                //     }
+                //     currentUserId = null;
+                // });
 
                 //SOcket disconnection logic
                 // --- Modify Socket.IO disconnect logic ---
@@ -296,7 +365,19 @@ async function emitOnlineUsersUpdate() {
                     if (accepted) {
                         console.log(`${opponent.name} accepted challenge from ${challenger.name}. Starting game.`);
                         const gameId = uuidv4(); // Unique ID for this game session/room
-                        const puzzle = generateHectocPuzzle();
+                        
+                        //// const puzzle = generateHectocPuzzle();
+                        
+                        let puzzle = null;
+                        try {
+                            // *** CORRECTED: Use the imported HectocGenerator ***
+                            const challengeObject = HectocGenerator.generate(); // Returns HectocChallenge object
+                            puzzle = challengeObject.toString(); // Get the puzzle string
+                        } catch (puzzleError) {
+                            console.error("[Game Start] CRITICAL: Failed to generate Hectoc puzzle:", puzzleError);
+                            io.to(challenger.socketId).to(socket.id).emit('game_start_failed', { reason: 'server_puzzle_error' });
+                            return;
+                        }
                         const startTime = new Date();
 
                         // Store initial game details in memory
