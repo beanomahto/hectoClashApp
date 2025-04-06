@@ -5,6 +5,7 @@ const bodyParser = require("body-parser");
 const connectDB = require("./src/config/db");
 const authRoutes = require("./routes/authRoutes");
 const userRoutes = require("./routes/userRoutes");
+const  gameRoutes = require("./routes/gameRoutes");
 const http = require("http");
 const { Server } = require("socket.io");
 const User = require("./models/User");
@@ -78,8 +79,10 @@ app.use(bodyParser.json());
 
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
+app.use("/api/profile", userRoutes);
 app.use("/api/friends", friendRoutes(io));
 app.use("/api/leaderboard", leaderboardRoutes); // Make sure this route is defined
+app.use("/api/games", gameRoutes); // <<< NEW: Use game routes
 
 // --- Helper Functions ---
 
@@ -137,6 +140,105 @@ function validateHectocSolution(puzzle, solution) {
         return { isValid: false, reason: 'evaluation_error', error: error.message };
     }
 }
+
+// --- Centralized Game Starting Function ---
+async function startGame(player1Data, player2Data) {
+    const gameId = uuidv4();
+    const firstPuzzle = generateHectocPuzzleSafe();
+    const startTime = new Date();
+
+    console.log(`[startGame] Attempting to start game ${gameId} between ${player1Data.name} and ${player2Data.name}`);
+
+    if (!firstPuzzle) {
+        console.error("[startGame] CRITICAL: Failed to generate first Hectoc puzzle.");
+        io.to(player1Data.socketId).to(player2Data.socketId).emit('game_start_failed', { reason: 'server_puzzle_error' });
+        return null;
+    }
+
+    const firstRoundStartTime = new Date();
+    const newGame = {
+        gameId: gameId,
+        player1Id: player1Data.userId,
+        player2Id: player2Data.userId,
+        player1: { userId: player1Data.userId, name: player1Data.name, socketId: player1Data.socketId },
+        player2: { userId: player2Data.userId, name: player2Data.name, socketId: player2Data.socketId },
+        startTime: startTime,
+        overallTimeLimitSeconds: OVERALL_GAME_TIME_LIMIT_SECONDS,
+        roundTimeLimitSeconds: ROUND_TIME_LIMIT_SECONDS,
+        status: 'in_progress',
+        currentRound: 0,
+        player1Score: 0,
+        player2Score: 0,
+        rounds: [{
+            roundNumber: 1,
+            puzzle: firstPuzzle,
+            startTime: firstRoundStartTime,
+            player1: { solution: null, timeTakenMs: null, correct: null },
+            player2: { solution: null, timeTakenMs: null, correct: null }
+        }],
+        overallTimerId: null,
+        roundTimerId: null,
+        spectators: [] // <<< NEW: Initialize spectators array
+    };
+    activeGames[gameId] = newGame;
+
+    try {
+        // Add initial spectators field to DB if needed, or handle dynamically
+        await Game.create({
+            gameId: gameId,
+            player1: { userId: player1Data.userId, name: player1Data.name },
+            player2: { userId: player2Data.userId, name: player2Data.name },
+            startTime: startTime,
+            overallTimeLimitSeconds: OVERALL_GAME_TIME_LIMIT_SECONDS,
+            roundTimeLimitSeconds: ROUND_TIME_LIMIT_SECONDS,
+            status: 'in_progress',
+            currentRound: 0,
+            rounds: [{ roundNumber: 1, puzzle: firstPuzzle, startTime: firstRoundStartTime }]
+            // spectators field not strictly necessary in DB unless you want persistence
+        });
+        console.log(`[DB] Game ${gameId} created in DB.`);
+    } catch(dbError) {
+        console.error(`[DB Error] Failed to create game ${gameId} in DB:`, dbError);
+        io.to(player1Data.socketId).to(player2Data.socketId).emit('game_start_failed', { reason: 'server_db_error'});
+        delete activeGames[gameId];
+        return null;
+    }
+
+    const socket1 = io.sockets.sockets.get(player1Data.socketId);
+    const socket2 = io.sockets.sockets.get(player2Data.socketId);
+    if (socket1) socket1.join(gameId);
+    if (socket2) socket2.join(gameId);
+    console.log(`Sockets for ${player1Data.name} and ${player2Data.name} joined room ${gameId}`);
+
+    const game = activeGames[gameId];
+    game.overallTimerId = setTimeout(async () => {
+        console.log(`[Timer] Overall challenge ${gameId} timed out.`);
+        if (activeGames[gameId]) { await endChallenge(gameId, 'timeout', 'overall_time_limit_reached'); }
+    }, game.overallTimeLimitSeconds * 1000);
+
+    game.roundTimerId = setTimeout(async () => {
+        console.log(`[Timer] Round 1 timed out for game ${gameId}`);
+        if (activeGames[gameId] && activeGames[gameId].currentRound === 0) { await handleRoundEnd(gameId, null, 'timeout'); }
+    }, game.roundTimeLimitSeconds * 1000);
+
+    const challengeStartData = {
+        gameId: gameId,
+        totalRounds: TOTAL_ROUNDS,
+        roundTimeLimitSeconds: game.roundTimeLimitSeconds,
+        overallTimeLimitSeconds: game.overallTimeLimitSeconds,
+        player1: { id: player1Data.userId, name: player1Data.name },
+        player2: { id: player2Data.userId, name: player2Data.name },
+        currentRound: 1,
+        puzzle: firstPuzzle,
+        player1Score: 0,
+        player2Score: 0
+    };
+    io.to(gameId).emit('challenge_start', challengeStartData);
+    console.log(`Emitted challenge_start for game ${gameId}`);
+
+    return gameId;
+}
+
 
 // --- <<< NEW: Centralized Game Starting Function >>> ---
 // This can be called by both direct challenges (respond_challenge) and matchmaking
@@ -435,19 +537,28 @@ async function endChallenge(gameId, finalStatus, reason = "normal") {
     }
 
     // --- Notify Clients ---
-    const payload = {
-        gameId,
-        finalStatus,
-        reason,
-        challengeWinnerId,
-        challengeLoserId,
-        isDraw,
-        player1Score: game.player1Score,
-        player2Score: game.player2Score,
-        roundsData: game.rounds // Send detailed round breakdown
-    };
-    console.log(`[GameHandler] Emitting challenge_over to room ${gameId}`);
-    io.to(gameId).emit('challenge_over', payload);
+    // const payload = {
+    //     gameId,
+    //     finalStatus,
+    //     reason,
+    //     challengeWinnerId,
+    //     challengeLoserId,
+    //     isDraw,
+    //     player1Score: game.player1Score,
+    //     player2Score: game.player2Score,
+    //     roundsData: game.rounds // Send detailed round breakdown
+    // };
+    // console.log(`[GameHandler] Emitting challenge_over to room ${gameId}`);
+    // io.to(gameId).emit('challenge_over', payload);
+
+
+
+       // --- Notify Clients (including spectators in the room) ---
+       const payload = { gameId, finalStatus, reason, challengeWinnerId, challengeLoserId, isDraw, player1Score: game.player1Score, player2Score: game.player2Score, roundsData: game.rounds };
+       console.log(`[GameHandler] Emitting challenge_over to room ${gameId}`);
+       io.to(gameId).emit('challenge_over', payload);
+
+
 
     // --- Clean Up Server State ---
     const player1SocketId = onlineUsers[game.player1Id]?.socketId;
@@ -457,6 +568,19 @@ async function endChallenge(gameId, finalStatus, reason = "normal") {
     if (socket1) socket1.leave(gameId);
     if (socket2) socket2.leave(gameId);
     console.log(`Sockets removed from room ${gameId}`);
+
+    // --- <<< NEW: Make Spectators leave the room >>> ---
+    if (game.spectators && game.spectators.length > 0) {
+        console.log(`Removing ${game.spectators.length} spectators from room ${gameId}`);
+        game.spectators.forEach(spectator => {
+            const spectatorSocket = io.sockets.sockets.get(spectator.socketId);
+            if (spectatorSocket) {
+                spectatorSocket.leave(gameId);
+            }
+        });
+    }
+    // --- <<< END NEW >>> ---
+
 
     delete activeGames[gameId]; // Remove from active games map
 }
@@ -586,6 +710,19 @@ io.on("connection", (socket) => {
                 console.log(`[Matchmaking] User ${userIdToCleanup} disconnected, removed from queue.`);
             }
             // --- <<< END NEW >>> ---
+
+             // --- <<< NEW: Handle disconnect while spectating >>> ---
+             Object.values(activeGames).forEach(game => {
+                if (game.spectators) {
+                    const spectatorIndex = game.spectators.findIndex(spec => spec.userId === userIdToCleanup && spec.socketId === socket.id);
+                    if (spectatorIndex > -1) {
+                        game.spectators.splice(spectatorIndex, 1);
+                        console.log(`[Spectate] User ${userIdToCleanup} disconnected, removed from spectating game ${game.gameId}`);
+                    }
+                }
+           });
+           // --- <<< END NEW >>> ---
+
 
             delete onlineUsers[userIdToCleanup];
             app.set('onlineUsers', onlineUsers);
@@ -756,6 +893,101 @@ io.on("connection", (socket) => {
          }
     });
     // --- <<< END NEW >>> ---
+
+    socket.on('join_spectate', (data) => {
+        const { gameId } = data;
+        if (!currentUserId || !onlineUsers[currentUserId]) {
+            console.error(`[Spectate] 'join_spectate' from unknown/offline user (socket ${socket.id}).`);
+            return socket.emit('spectate_failed', { reason: 'not_logged_in' });
+        }
+        if (!gameId) {
+            console.error(`[Spectate] 'join_spectate' received without gameId from ${currentUserId}`);
+            return socket.emit('spectate_failed', { reason: 'invalid_game_id' });
+        }
+
+        const game = activeGames[gameId];
+        if (!game || game.status !== 'in_progress') {
+            console.log(`[Spectate] User ${currentUserId} tried to spectate inactive/non-existent game ${gameId}`);
+            return socket.emit('spectate_failed', { reason: 'game_not_found_or_over' });
+        }
+
+        // Check if user is playing in this game
+        if (game.player1Id === currentUserId || game.player2Id === currentUserId) {
+            console.log(`[Spectate] User ${currentUserId} tried to spectate own game ${gameId}`);
+            return socket.emit('spectate_failed', { reason: 'cannot_spectate_own_game' });
+        }
+
+        // Check if already spectating this game
+        const isSpectating = game.spectators.some(spec => spec.userId === currentUserId);
+        if (isSpectating) {
+            console.log(`[Spectate] User ${currentUserId} already spectating game ${gameId}`);
+            // Re-join room just in case and send current state again
+             socket.join(gameId); // Ensure they are in the room
+             // Send current state
+             const currentState = {
+                 gameId: game.gameId,
+                 currentRound: game.currentRound + 1, // Send 1-based round number
+                 puzzle: game.rounds[game.currentRound]?.puzzle, // Current puzzle
+                 player1: { id: game.player1Id, name: game.player1.name },
+                 player2: { id: game.player2Id, name: game.player2.name },
+                 player1Score: game.player1Score,
+                 player2Score: game.player2Score,
+                 roundStartTime: game.rounds[game.currentRound]?.startTime,
+                 roundTimeLimitSeconds: game.roundTimeLimitSeconds,
+                 totalRounds: TOTAL_ROUNDS
+             };
+             socket.emit('spectate_game_state', currentState);
+            return;
+        }
+
+        // Add spectator
+        const spectatorInfo = { userId: currentUserId, socketId: socket.id };
+        game.spectators.push(spectatorInfo);
+        socket.join(gameId); // Join the broadcast room
+
+        console.log(`[Spectate] User ${currentUserId} started spectating game ${gameId}. Total spectators: ${game.spectators.length}`);
+
+        // Send current game state to the new spectator
+        const currentState = {
+            gameId: game.gameId,
+            currentRound: game.currentRound + 1, // 1-based
+            puzzle: game.rounds[game.currentRound]?.puzzle,
+            player1: { id: game.player1Id, name: game.player1.name },
+            player2: { id: game.player2Id, name: game.player2.name },
+            player1Score: game.player1Score,
+            player2Score: game.player2Score,
+            roundStartTime: game.rounds[game.currentRound]?.startTime, // Send start time for timer sync
+            roundTimeLimitSeconds: game.roundTimeLimitSeconds,
+            totalRounds: TOTAL_ROUNDS
+        };
+        socket.emit('spectate_game_state', currentState); // Send only to the joining spectator
+    });
+
+    socket.on('leave_spectate', (data) => {
+        const { gameId } = data;
+         if (!currentUserId) return; // Ignore if user unknown
+         if (!gameId) return console.log(`[Spectate] 'leave_spectate' received without gameId from ${currentUserId}`);
+
+         const game = activeGames[gameId];
+         if (!game || !game.spectators) {
+             console.log(`[Spectate] User ${currentUserId} tried to leave non-existent/non-spectated game ${gameId}`);
+             return; // Game doesn't exist or has no spectators array
+         }
+
+         const initialLength = game.spectators.length;
+         game.spectators = game.spectators.filter(spec => !(spec.userId === currentUserId && spec.socketId === socket.id));
+
+         if (game.spectators.length < initialLength) {
+             socket.leave(gameId); // Leave the broadcast room
+             console.log(`[Spectate] User ${currentUserId} stopped spectating game ${gameId}. Remaining: ${game.spectators.length}`);
+             socket.emit('left_spectate_confirm', { gameId }); // Optional confirmation
+         } else {
+             console.log(`[Spectate] User ${currentUserId} tried to leave game ${gameId} but was not found spectating.`);
+         }
+    });
+
+    // --- <<< END NEW >>> ---
+
 
 }); // End io.on('connection')
 
