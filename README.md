@@ -1,12 +1,10 @@
 # Android app :
-# repo: https://github.com/theprashantkumardas/HectoClash
-# repo for backend : https://github.com/theprashantkumardas/HectoClashBackend 
+# repo: https://github.com/MonuGit9/HectocApp
+
 
 ## full track of activity for both android and backend api will be found here 
+## repo : https://github.com/theprashantkumardas/HectoClash (for activity traction)
+## repo for backend : https://github.com/theprashantkumardas/HectoClashBackend 
 
-commit:Auth Setup,
-commit :Server wrapped with websocket and hectoc puzzle Generation,
-commit : Android app Updated,
-commit: friend list and send reject option,
-commit: Online Game Option
-commit:handle the play match added
+During our last moment, our code clashes between new features and old completly working features.
+( we were working on Impletation of spectator mode and we henced acheved it nearby ) 
